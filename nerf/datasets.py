@@ -470,7 +470,13 @@ class LLFF(Dataset):
     return poses_reset
 
 class LLFFVideo(Dataset):
-  """LLFF video dataset."""
+  """LLFF video dataset.
+  
+  image shape: [F,N,H,W,C]
+  pose shape: [N,3,4]
+  ray shape: item in tuple: [N, H, W, 3]
+
+  """
 
   def _load_renderings(self, args):
     imgdir_suffix = ""
@@ -520,8 +526,8 @@ class LLFFVideo(Dataset):
         [poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)
     images = np.moveaxis(images, -1, 0)
-    images = np.moveaxis(images, -1, 1)
-    # change shape to [N,F,H,W,C]
+    images = np.moveaxis(images, -1, 0)
+    # change shape to [F,N,H,W,C]
 
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)
 
@@ -543,26 +549,28 @@ class LLFFVideo(Dataset):
       self._generate_spiral_poses(poses, bds)
 
     # Select the split.
-    i_test = np.arange(images.shape[0])[0] # use first camera as test
+    i_test = np.arange(images.shape[1])[0] # use first camera as test
     i_train = np.array(
-        [i for i in np.arange(int(images.shape[0])) if i not in i_test])
+        [i for i in np.arange(int(images.shape[1])) if i not in i_test])
     if self.split == "train":
       indices = i_train
     else:
       indices = i_test
-    images = images[indices]
+    images = images[:,indices]
     poses = poses[indices]
 
     self.images = images
     self.camtoworlds = poses[:, :3, :4]
     self.focal = poses[0, -1, -1]
-    self.frame_num = images.shape[1]
+    self.frame_num = images.shape[0]
+    self.cam_num = images.shape[1]
     self.h, self.w = images.shape[2:4]
     self.resolution = self.h * self.w
+    self.time_tokens = np.arange(self.frame_num, dtype=np.long)
     if args.render_path:
       self.n_examples = self.render_poses.shape[0]
     else:
-      self.n_examples = images.shape[0]*images.shape[1]
+      self.n_examples = self.frame_num*self.cam_num
       
   def _generate_rays(self):
     """Generate normalized device coordinate rays for llff."""
@@ -713,6 +721,24 @@ class LLFFVideo(Dataset):
       self.render_poses = new_poses[:, :3, :4]
     return poses_reset
 
+  def _train_init(self, args):
+    """Initialize training."""
+    self._load_renderings(args)
+    self._generate_rays()
+
+    if args.batching == "all_images":
+      # flatten the ray and image dimension together.
+      self.images = self.images.reshape([self.frame_num,-1, 3])
+      self.rays = utils.namedtuple_map(lambda r: r.reshape([-1, r.shape[-1]]),
+                                       self.rays)
+    elif args.batching == "single_image":
+      self.images = self.images.reshape([self.frame_num, -1, self.resolution, 3])
+      self.rays = utils.namedtuple_map(
+          lambda r: r.reshape([-1, self.resolution, r.shape[-1]]), self.rays)
+    else:
+      raise NotImplementedError(
+          f"{args.batching} batching strategy is not implemented.")
+
   def _next_train(self):
     """Sample next training batch."""
     # TODO: need to add time token to the input
@@ -720,35 +746,45 @@ class LLFFVideo(Dataset):
     if self.batching == "all_images":
       ray_indices = np.random.randint(0, self.rays[0].shape[0],
                                       (self.batch_size,))
-      batch_pixels = self.images[ray_indices]
+      time_indices = np.random.randint(0, self.frame_num,
+                                        (self.batch_size,))
+      batch_pixels = self.images[time_indices,ray_indices]
       batch_rays = utils.namedtuple_map(lambda r: r[ray_indices], self.rays)
     elif self.batching == "single_image":
-      image_index = np.random.randint(0, self.n_examples, ())
+      time_indices = np.random.randint(0, self.frame_num, ())
+      image_index = np.random.randint(0, self.cam_num, ())
       ray_indices = np.random.randint(0, self.rays[0][0].shape[0],
                                       (self.batch_size,))
-      batch_pixels = self.images[image_index][ray_indices]
+      batch_pixels = self.images[time_indices][image_index][ray_indices]
       batch_rays = utils.namedtuple_map(lambda r: r[image_index][ray_indices],
                                         self.rays)
     else:
       raise NotImplementedError(
           f"{self.batching} batching strategy is not implemented.")
-    return {"pixels": batch_pixels, "rays": batch_rays}
+    return {"pixels": batch_pixels, "rays": batch_rays, "time_idx":time_indices}
 
   def _next_test(self):
     """Sample next test example."""
     # TODO: need to add time token to the input
     idx = self.it
-    self.it = (self.it + 1) % self.n_examples
+    
 
     if self.render_path:
-      return {"rays": utils.namedtuple_map(lambda r: r[idx], self.render_rays)}
+      assert self.n_examples > 1
+      self.it = (self.it + 1) % self.n_examples
+      
+      return {"rays": utils.namedtuple_map(lambda r: r[idx], self.render_rays),
+              "time_idx": float(idx)/(self.n_examples-1)*(self.frame_num-1)}
     else:
+      self.it = (self.it + 1) % self.frame_num
       return {
-          "pixels": self.images[idx],
-          "rays": utils.namedtuple_map(lambda r: r[idx], self.rays)
+          "pixels": self.images[idx][0],
+          "rays": utils.namedtuple_map(lambda r: r[0], self.rays),
+          "time_idx": idx
       }
 
 dataset_dict = {
     "blender": Blender,
     "llff": LLFF,
+    "llffvideo": LLFFVideo,
 }
